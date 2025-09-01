@@ -894,7 +894,7 @@ class BOJHelper:
 
         if not no_git:
             self.git.run("add", "-A")
-            msg = f"solve(boj): #{pid} - {name}"
+            msg = f"feat(boj/solve): #{pid} - {name}"
             self.git.run("commit", "-m", msg)
             print(f"{L.OK} committed: {msg}")
             if push:
@@ -1076,7 +1076,7 @@ class BOJHelper:
         if not no_git:
             try:
                 self.git.run("add", "-A")
-                msg = f"chore(boj): drop #{pid}" + (f" - {name}" if name else "")
+                msg = f"chore(boj/drop): #{pid}" + (f" - {name}" if name else "")
                 self.git.run("commit", "-m", msg)
                 print(f"{L.OK} committed: {msg}")
                 if push:

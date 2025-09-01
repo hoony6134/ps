@@ -739,6 +739,26 @@ class Runner:
             })
         return results
 
+    def run_cases_argv(self, argv: list[str], cases: list[tuple[str, str]]) -> list[dict]:
+        results = []
+        for i, (inp, expected) in enumerate(cases, 1):
+            start = subprocess.time.time() if hasattr(subprocess, 'time') else __import__('time').time()
+            proc = subprocess.run(argv, input=inp, text=True, capture_output=True)
+            dur_ms = int(((__import__('time').time() - start) * 1000))
+            out = proc.stdout.rstrip("\n")
+            exp = expected.rstrip("\n")
+            ok = (proc.returncode == 0) and (out == exp)
+            results.append({
+                "idx": i,
+                "ok": ok,
+                "exit": proc.returncode,
+                "ms": dur_ms,
+                "expected": exp,
+                "actual": out,
+                "stderr": proc.stderr,
+            })
+        return results
+
 
 # ================================== Core =====================================
 class BOJHelper:

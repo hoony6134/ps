@@ -945,6 +945,149 @@ class BOJHelper:
             print(f"{L.HINT} python source; nothing to remove from CMake: {rel_src}")
         print(f"{L.HINT} code file kept: {src.relative_to(self.paths.root)}")
 
+    # ----------------------------- drop command ------------------------------
+    def drop(self, pid: int, name: Optional[str], lang: Optional[str], push: bool, no_git: bool, force: bool = False) -> None:
+        """Remove ALL related artifacts for a problem:
+        - Remove source file (from solving/ or thousand folder)
+        - Remove the file from CMake ps target (when C++)
+        - Remove generated markdown doc under docs/boj/
+        - Remove saved samples under tests/boj/<pid>/
+        - Optionally git commit/push (default commit, push optional)
+        """
+        lang = (lang or self.config.get("lang", "cpp")).lower()
+
+        # 1) Try to locate a code file (prefer solving/, then thousand folder, then anywhere)
+        src: Optional[Path] = None
+        # prefer name-guided path first
+        if name:
+            candidate = self.paths.solving / f"{pid} - {sanitize_filename(name)}.{lang}"
+            if candidate.exists():
+                src = candidate
+        if src is None:
+            cand_solving = sorted(self.paths.solving.glob(f"{pid} -*.{lang}"))
+            if cand_solving:
+                src = cand_solving[0]
+        # also look inside thousand folder
+        if src is None:
+            thousand_dir = self.paths.root / thousand_folder(pid)
+            cand_thousand = sorted(thousand_dir.glob(f"{pid} -*.{lang}"))
+            if cand_thousand:
+                src = cand_thousand[0]
+        # shallow repo search as last resort
+        if src is None:
+            cand_any = sorted(self.paths.root.glob(f"**/{pid} -*.{lang}"))
+            if cand_any:
+                src = cand_any[0]
+        # final try: if still missing and name omitted, try fetching title
+        if src is None and not name:
+            fetched = self.fetcher.fetch(pid)
+            if fetched:
+                name = fetched
+                candidate = self.paths.solving / f"{pid} - {sanitize_filename(name)}.{lang}"
+                if candidate.exists():
+                    src = candidate
+
+        # 2) If C++ and the file is enrolled in CMake, remove it from the ps target
+        if src is not None and lang == "cpp":
+            try:
+                rel_src = self._rel(src)
+                self.cmake.remove(rel_src)
+                print(f"{L.OK} removed from ps target: {rel_src}")
+            except Exception as e:
+                if force:
+                    print(f"{L.WARN} failed to adjust CMake (continuing due to --force): {e}")
+                else:
+                    print(f"{L.WARN} failed to adjust CMake: {e}")
+
+        # 3) Delete the code file(s). We try both solving/ and thousand/ locations just in case.
+        deleted_any = False
+        paths_to_try: list[Path] = []
+        if src is not None:
+            paths_to_try.append(src)
+        # predictable locations by pid/name if known
+        if name:
+            paths_to_try += [
+                self.paths.solving / f"{pid} - {sanitize_filename(name)}.{lang}",
+                (self.paths.root / thousand_folder(pid)) / f"{pid} - {sanitize_filename(name)}.{lang}",
+            ]
+        # unique-ify while preserving order
+        seen = set()
+        uniq_paths: list[Path] = []
+        for p in paths_to_try:
+            try:
+                key = p.resolve()
+            except Exception:
+                key = p
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq_paths.append(p)
+
+        for p in uniq_paths:
+            try:
+                if p.exists():
+                    p.unlink()
+                    print(f"{L.OK} deleted code: {p.relative_to(self.paths.root)}")
+                    deleted_any = True
+            except Exception as e:
+                if force:
+                    print(f"{L.WARN} failed to delete {p}: {e}")
+                else:
+                    raise
+
+        if not deleted_any:
+            msg = f"No code file found for id={pid} (lang={lang})."
+            if force:
+                print(f"{L.WARN} {msg}")
+            else:
+                print(f"{L.WARN} {msg}")
+
+        # 4) Delete markdown doc(s)
+        doc_dir = self.paths.root / "docs" / "boj"
+        if doc_dir.exists():
+            md_matches = list(doc_dir.glob(f"{pid} -*.md"))
+            if not md_matches and name:
+                md_path = doc_dir / f"{pid} - {sanitize_filename(name)}.md"
+                if md_path.exists():
+                    md_matches = [md_path]
+            for m in md_matches:
+                try:
+                    m.unlink()
+                    print(f"{L.OK} deleted doc: {m.relative_to(self.paths.root)}")
+                except Exception as e:
+                    if force:
+                        print(f"{L.WARN} failed to delete doc {m}: {e}")
+                    else:
+                        raise
+
+        # 5) Delete stored samples
+        tests_dir = self.paths.root / "tests" / "boj" / str(pid)
+        if tests_dir.exists():
+            try:
+                shutil.rmtree(tests_dir, ignore_errors=False)
+                print(f"{L.OK} deleted tests: {tests_dir.relative_to(self.paths.root)}")
+            except Exception as e:
+                if force:
+                    print(f"{L.WARN} failed to delete tests dir {tests_dir}: {e}")
+                else:
+                    raise
+
+        # 6) Optionally git record
+        if not no_git:
+            try:
+                self.git.run("add", "-A")
+                msg = f"chore(boj): drop #{pid}" + (f" - {name}" if name else "")
+                self.git.run("commit", "-m", msg)
+                print(f"{L.OK} committed: {msg}")
+                if push:
+                    self.git.run("push")
+                    print(f"{L.OK} pushed")
+            except Exception as e:
+                if force:
+                    print(f"{L.WARN} git ops failed (continuing due to --force): {e}")
+                else:
+                    raise
+
     def run_cases_argv(self, argv: List[str], cases: list[tuple[str, str]]) -> list[dict]:
         results = []
         for i, (inp, expected) in enumerate(cases, 1):
@@ -1100,6 +1243,16 @@ class CLI:
         dp.add_argument("name", nargs="?", default=None, help="(optional) title to help locate the file")
         dp.add_argument("-l", "--lang", choices=["cpp", "py"], default="py")
 
+        # drop
+        xp = sub.add_parser("drop", help="delete all related files (code, doc, tests) and update ps target (no restore)")
+        xp.set_defaults(cmd="drop")
+        xp.add_argument("id", type=int)
+        xp.add_argument("name", nargs="?", default=None, help="(optional) title to help locate files")
+        xp.add_argument("-l", "--lang", choices=["cpp", "py"], default="py")
+        xp.add_argument("-p", "--push", action="store_true")
+        xp.add_argument("-n", "--no-git", action="store_true")
+        xp.add_argument("-f", "--force", action="store_true", help="continue even if some steps fail")
+
         # run
         rp = sub.add_parser("run", aliases=["r"], help="fetch samples and run them against the ps binary")
         rp.set_defaults(cmd="run")
@@ -1116,6 +1269,7 @@ class CLI:
             "  start  (s, st)   create file and add into ps target\n"
             "  finish (f, fin)  move file, remove from ps target, and optionally git commit/push\n"
             "  delete (d, del)  remove from ps target only (code kept, no git)\n"
+            "  drop             delete all related files (code, doc, tests) and update ps target\n"
             "  run    (r)       fetch samples and run them against the ps binary\n"
             "  help   (h)       show this help or per-command usage\n"
         )
@@ -1131,6 +1285,8 @@ class CLI:
             self.h.finish(args.id, args.name, args.lang, args.push, args.no_git)
         elif args.cmd == "delete":
             self.h.delete(args.id, args.name, args.lang)
+        elif args.cmd == "drop":
+            self.h.drop(args.id, args.name, args.lang, args.push, args.no_git, getattr(args, "force", False))
         elif args.cmd == "run":
             self.h.run(args.id, args.bin)
         elif args.cmd == "help":
@@ -1157,6 +1313,8 @@ class CLI:
                     print("usage: boj finish|f|fin <id> [name] [-l {cpp,py}] [-p] [-n]")
                 elif canonical == "delete":
                     print("usage: boj delete|d|del <id> [name] [-l {cpp,py}]")
+                elif canonical == "drop":
+                    print("usage: boj drop <id> [name] [-l {cpp,py}] [-p] [-n] [-f]")
                 elif canonical == "run":
                     print("usage: boj run|r <id> [-b <path-to-ps>]")
 

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Baekjoon workflow helper (start / finish)
-Refactored: modular classes + clearer structure, same CLI and behavior
-- start: create source under `solving/` and APPEND it into add_executable(ps ...)
-- finish: move the file to thousand-range folder, REMOVE it from add_executable(ps ...), and git commit/push
+Baekjoon (BOJ) 워크플로 도우미
+- start: 문제별 디렉터리(코드 + README) 생성
+- finish: 천 단위 폴더로 이동하고(선택) git 커밋/푸시
+- md: 문제 페이지를 크롤링하여 Markdown 생성
+- run: 샘플을 가져와 풀이에 실행
 
-It fetches the problem title from solved.ac (API v3) with crawler fallback.
+solved.ac 를 활용해 제목/난이도를 보강하고, HTML 크롤링으로 최대한 복원합니다.
 """
 from __future__ import annotations
 
@@ -21,12 +22,24 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
+from typing import TypedDict
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from datetime import datetime
+
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+except Exception:  # pragma: no cover
+    BeautifulSoup = None  # type: ignore
 
 
-# ============================ ANSI Color Helpers =============================
+# ---- 섹션 구조를 위한 TypedDicts ----
+class SectionDict(TypedDict):
+    id: str
+    title: str
+    content: str
+
+
+# ============================ ANSI 색상 도우미 =============================
 
 class Ansi:
     RESET = "\x1b[0m"
@@ -53,7 +66,7 @@ class Ansi:
         return "".join(codes) + s + Ansi.RESET
 
 
-# Runtime color toggle based on TTY/NO_COLOR
+# TTY/NO_COLOR 환경에 따라 색상 출력 여부를 결정
 def _colors_enabled() -> bool:
     try:
         if os.environ.get("NO_COLOR"):
@@ -76,7 +89,7 @@ def _wrap_cond(s: str, *codes: str) -> str:
 Ansi.wrap = staticmethod(_wrap_cond)
 
 
-# Box drawing characters (ASCII fallback)
+# 박스 그리기 문자 (환경 변수에 따라 ASCII 대체 지원)
 class Box:
     if os.environ.get("ASCII_BOX"):
         H, V, TL, TR, BL, BR, T, B, L, R, X = "-", "|", "+", "+", "+", "+", "+", "+", "+", "+", "+"
@@ -103,9 +116,10 @@ try:
 except Exception:  # pragma: no cover
     _CAFILE = None
 
-# ============================ Constants & Templates ============================
+# ============================ 상수와 템플릿 ============================
 INVALID_FS = r"[\\/:*?\"<>|]"
 
+# C++ 문제 템플릿
 CPP_TEMPLATE = """// BOJ {id} - {name}
 #include <bits/stdc++.h>
 #define endl "\\n"
@@ -123,11 +137,13 @@ int main() {{
 }}
 """
 
+# 파이썬 문제 템플릿
 PY_TEMPLATE = """# BOJ {id} - {name}
 import sys
+input = sys.stdin.readline
 
 def main():
-    data = sys.stdin.read().strip().split()
+    data = input().split()
     pass
 
 if __name__ == "__main__":
@@ -135,157 +151,56 @@ if __name__ == "__main__":
 """
 
 DEFAULT_CFG = {
-    "lang": "py",  # default language
-    "run_dir": "${CMAKE_BINARY_DIR}/bin",  # not used when injecting into ps target
+    "lang": "py",  # 기본 언어
+    "run_dir": "${CMAKE_BINARY_DIR}/bin",  # ps 타겟에 직접 주입할 때는 사용하지 않음
 }
-
 
 SOLVEDAC_URL = "https://solved.ac/api/v3/problem/show?problemId={pid}"
 
-# ---- solved.ac tier mapping (algorithm tier; arena ignored) ----
-TIER_NAMES = [
-    "Unrated",
-    "Bronze V",
-    "Bronze IV",
-    "Bronze III",
-    "Bronze II",
-    "Bronze I",
-    "Silver V",
-    "Silver IV",
-    "Silver III",
-    "Silver II",
-    "Silver I",
-    "Gold V",
-    "Gold IV",
-    "Gold III",
-    "Gold II",
-    "Gold I",
-    "Platinum V",
-    "Platinum IV",
-    "Platinum III",
-    "Platinum II",
-    "Platinum I",
-    "Diamond V",
-    "Diamond IV",
-    "Diamond III",
-    "Diamond II",
-    "Diamond I",
-    "Ruby V",
-    "Ruby IV",
-    "Ruby III",
-    "Ruby II",
-    "Ruby I",
-    "Master",
-]
 
-TIER_COLORS = {
-    # bronze
-    1: "#9d4900",
-    2: "#a54f00",
-    3: "#ad5600",
-    4: "#b55d0a",
-    5: "#c67739",
-    # silver
-    6: "#38546e",
-    7: "#3d5a74",
-    8: "#435f7a",
-    9: "#496580",
-    10: "#4e6a86",
-    # gold
-    11: "#d28500",
-    12: "#df8f00",
-    13: "#ec9a00",
-    14: "#f9a518",
-    15: "#ffb028",
-    # platinum
-    16: "#00c78b",
-    17: "#00d497",
-    18: "#27e2a4",
-    19: "#3ef0b1",
-    20: "#51fdbd",
-    # diamond
-    21: "#009ee5",
-    22: "#00a9f0",
-    23: "#00b4fc",
-    24: "#2bbfff",
-    25: "#41caff",
-    # ruby
-    26: "#e0004c",
-    27: "#ea0053",
-    28: "#f5005a",
-    29: "#ff0062",
-    30: "#ff3071",
-    # master
-    31: "#b300e0",
-}
-
-TIER_BADGE_BASE = "https://d2gd6pc034wcta.cloudfront.net/tier/"
-
-def resolve_tier_badge_url(tier: int | None) -> str:
-    try:
-        t = int(tier) if tier is not None else 0
-    except Exception:
-        t = 0
-    # Clamp to valid solved.ac tier sprite range (0~31 assumed)
-    if t < 0 or t > 31:
-        t = 0
-    return f"{TIER_BADGE_BASE}{t}.svg"
-
-def resolve_algo_tier(tier: int | None) -> str:
-    try:
-        if tier is None:
-            return "Unrated"
-        return TIER_NAMES[int(tier)] if 0 <= int(tier) < len(TIER_NAMES) else "Unrated"
-    except Exception:
-        return "Unrated"
-
-
-def resolve_algo_color(tier: int | None) -> str:
-    try:
-        if tier is None:
-            return "#818996"  # unrated gray
-        return TIER_COLORS.get(int(tier), "#818996")
-    except Exception:
-        return "#818996"
-
-
-# ================================= Utilities =================================
+# ================================= 유틸리티 함수 =================================
 
 def sanitize_filename(s: str) -> str:
+    # 파일 이름에 사용할 수 없는 문자를 _로 대체
     s = re.sub(INVALID_FS, "_", s)
     return s.strip()
 
 
 def thousand_folder(pid: int) -> str:
+    # 천 단위 폴더 이름 생성
     base = (pid // 1000) * 1000
     return f"{base:05d}"
 
 
-# ================================== Paths ====================================
+# ================================== 경로 관련 ====================================
 @dataclass(frozen=True)
 class RepoPaths:
     root: Path
 
     @property
     def solving(self) -> Path:
+        # 문제 풀이 디렉터리
         return self.root / "solving"
 
     @property
     def cmakelists(self) -> Path:
+        # CMakeLists.txt 경로
         return self.root / "CMakeLists.txt"
 
     @property
     def config(self) -> Path:
+        # 설정 파일 경로
         return self.root / "bojconfig.json"
 
 
-# ================================== Config ===================================
+# ================================== 설정 ===================================
 class Config:
     def __init__(self, paths: RepoPaths):
         self.paths = paths
         self._cfg = DEFAULT_CFG | self._load()
 
     def _load(self) -> dict:
+        # bojconfig.json을 읽어 설정을 불러옴
         if self.paths.config.exists():
             try:
                 return json.loads(self.paths.config.read_text(encoding="utf-8"))
@@ -297,9 +212,546 @@ class Config:
         return self._cfg.get(key, default)
 
 
-# ================================ HTTP / Titles ===============================
+# ================================ HTTP / 제목 조회 ===============================
 class ProblemFetcher:
-    """Fetch problem metadata (title + sample I/O) via solved.ac (v3) with acmicpc.net fallback."""
+    # ---- HTML 표를 Markdown 표로 변환 ----
+    def _table_to_markdown(self, table_el) -> str:
+        if not table_el:
+            return ''
+        rows: list[list[str]] = []
+        heads = table_el.select('thead tr') if hasattr(table_el, 'select') else []
+        bodies = table_el.select('tbody tr') if hasattr(table_el, 'select') else []
+        if heads:
+            for tr in heads:
+                rows.append([c.get_text(strip=True) for c in tr.find_all(['th', 'td'])])
+        if bodies:
+            for tr in bodies:
+                rows.append([c.get_text(strip=True) for c in tr.find_all(['th', 'td'])])
+        if not rows:
+            for tr in table_el.find_all('tr'):
+                cells = [c.get_text(strip=True) for c in tr.find_all(['th', 'td'])]
+                if cells:
+                    rows.append(cells)
+        if not rows:
+            return ''
+        width = max(len(r) for r in rows)
+        rows = [r + [''] * (width - len(r)) for r in rows]
+        out = [
+            '| ' + ' | '.join(rows[0]) + ' |',
+            '| ' + ' | '.join(['---'] * width) + ' |',
+        ]
+        for r in rows[1:]:
+            out.append('| ' + ' | '.join(r) + ' |')
+        return "\n".join(out)
+
+    # ---- 섹션 노드를 Markdown 텍스트로 변환 (.spoiler 포함) ----
+    def _section_to_markdown(self, sec) -> str:
+        include_nodes = []
+        pt = sec.select_one('.problem-text')
+        include_nodes.append(pt if pt else sec)
+        include_nodes.extend(sec.select('.spoiler'))
+        combined_html = ''.join(str(el) for el in include_nodes)
+        if BeautifulSoup is not None:
+            tmp = BeautifulSoup(combined_html, 'html.parser')
+            for h in list(tmp.select('.headline h2')):
+                h.decompose()
+            for tbl in list(tmp.find_all('table')):
+                md_tbl = self._table_to_markdown(tbl)
+                from bs4 import NavigableString  # type: ignore
+                tbl.replace_with(NavigableString('\n' + md_tbl + '\n') if md_tbl else NavigableString(''))
+            combined_html = str(tmp)
+        cleaned = self._clean_html_block(combined_html)
+        if not cleaned.strip() and BeautifulSoup is not None:
+            tmp2 = BeautifulSoup(combined_html, 'html.parser')
+            items = [li.get_text(' ', strip=True) for li in tmp2.select('li')]
+            items = [it for it in items if it]
+            if items:
+                return '\n' + '\n'.join(f'- {it}' for it in items) + '\n'
+        return cleaned
+
+    # === HTML → Markdown 보조 함수 (bs4 사용) ===
+    def _bs4_convert_images(self, soup):
+        for img in list(soup.find_all('img')):
+            src = (img.get('src') or '').strip()
+            alt = (img.get('alt') or '').strip() or 'image'
+            if not src:
+                img.decompose()
+                continue
+            if src.startswith('//'):
+                src_abs = 'https:' + src
+            elif src.startswith('/'):
+                src_abs = 'https://www.acmicpc.net' + src
+            else:
+                src_abs = src
+            md_img = f"\n![{alt}]({src_abs})\n"
+            img.replace_with(md_img)
+
+    def _bs4_convert_inline_marks(self, soup):
+        for t in list(soup.find_all(['strong', 'b'])):
+            t.replace_with(f"**{t.get_text(separator=' ', strip=True)}**")
+        for t in list(soup.find_all(['em', 'i'])):
+            t.replace_with(f"*{t.get_text(separator=' ', strip=True)}*")
+        for t in list(soup.find_all(['s', 'del', 'strike'])):
+            t.replace_with(f"~~{t.get_text(separator=' ', strip=True)}~~")
+
+    def _bs4_convert_sup_sub(self, soup):
+        for t in list(soup.find_all('sup')):
+            t.replace_with(f"^{{{t.get_text(separator=' ', strip=True)}}}")
+        for t in list(soup.find_all('sub')):
+            t.replace_with(f"_{{{t.get_text(separator=' ', strip=True)}}}")
+
+    def _bs4_convert_lists(self, soup):
+        def _ul_to_md(ul):
+            items = [f"- {li.get_text(separator=' ', strip=True)}" for li in ul.find_all('li', recursive=False)]
+            return '\n' + '\n'.join(items) + '\n'
+
+        def _ol_to_md(ol):
+            items = [f"{i + 1}. {li.get_text(separator=' ', strip=True)}" for i, li in enumerate(ol.find_all('li', recursive=False))]
+            return '\n' + '\n'.join(items) + '\n'
+
+        for ul in list(soup.find_all('ul')):
+            ul.replace_with(_ul_to_md(ul))
+        for ol in list(soup.find_all('ol')):
+            ol.replace_with(_ol_to_md(ol))
+        # lone li (safety)
+        for li in list(soup.find_all('li')):
+            li.replace_with(f"- {li.get_text(separator=' ', strip=True)}")
+
+    def _bs4_convert_pre(self, soup):
+        for pre in list(soup.find_all('pre')):
+            # pre 태그 내의 텍스트를 가져옴 (HTML 엔티티 디코딩 포함)
+            import html
+            code_text = html.unescape(pre.get_text())
+            # 마크다운 코드 블록으로 변환
+            md_code = f"\n```\n{code_text}\n```\n"
+            pre.replace_with(md_code)
+
+    def _finalize_text_common(self, text: str) -> str:
+        import re as _re, html as _html
+        text = _html.unescape(text).replace('\r\n', '\n').replace('\r', '\n').replace('\u00a0', ' ')
+        text = _re.sub(r'([0-9A-Za-z]+)\s*\^\{([^}]+)\}', r'$\1^{\2}$', text)
+        text = _re.sub(r'([0-9A-Za-z]+)\s*_\{([^}]+)\}', r'$\1_{\2}$', text)
+        text = _re.sub(r'\n\s*([+*/=])', r' \1', text)
+        text = _re.sub(r'([+*/=])\s*\n', r'\1 ', text)
+        text = _re.sub(r'^(\s*)>(\s*)$', r'\1\\>\2', text, flags=_re.MULTILINE)
+        text = _re.sub(r'^(\s*)>\s+(?=\S)', r'\1\\> ', text, flags=_re.MULTILINE)
+        text = _re.sub(r'^[ \t]+', '', text, flags=_re.MULTILINE)
+        text = _re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip('\n')
+
+    # === HTML → Markdown 보조 함수 (정규식 폴백) ===
+    def _fallback_clean(self, fragment: str) -> str:
+        import re as _re, html as _html
+        frag = _re.sub(r'<br\s*/?>', '\n', fragment, flags=_re.IGNORECASE)
+        
+        # <pre> 태그를 마크다운 코드 블록으로 변환
+        def _pre_repl(m):
+            code_content = _html.unescape(m.group(1))
+            return f"\n```\n{code_content}\n```\n"
+        frag = _re.sub(r'<pre[^>]*>(.*?)</pre>', _pre_repl, frag, flags=_re.IGNORECASE | _re.DOTALL)
+        
+        frag = _re.sub(r'</?\s*(strong|b)\s*>', '**', frag, flags=_re.IGNORECASE)
+        frag = _re.sub(r'</?\s*(em|i)\s*>', '*', frag, flags=_re.IGNORECASE)
+        frag = _re.sub(r'</?\s*(s|del|strike)\s*>', '~~', frag, flags=_re.IGNORECASE)
+        frag = _re.sub(r'<\s*sup\s*>', '^{', frag, flags=_re.IGNORECASE)
+        frag = _re.sub(r'<\s*/\s*sup\s*>', '}', frag, flags=_re.IGNORECASE)
+        frag = _re.sub(r'<\s*sub\s*>', '_{', frag, flags=_re.IGNORECASE)
+        frag = _re.sub(r'<\s*/\s*sub\s*>', '}', frag, flags=_re.IGNORECASE)
+
+        def _img_repl(m):
+            src = (m.group(1) or '').strip()
+            alt = (m.group(2) or '').strip() or 'image'
+            if src.startswith('//'):
+                src_abs = 'https:' + src
+            elif src.startswith('/'):
+                src_abs = 'https://www.acmicpc.net' + src
+            else:
+                src_abs = src
+            return f"\n![{alt}]({src_abs})\n"
+
+        frag = _re.sub(r'<img[^>]*src\s*=\s*"([^"]+)"[^>]*alt\s*=\s*"([^"]*)"[^>]*>', _img_repl, frag, flags=_re.IGNORECASE)
+        frag = _re.sub(r"<img[^>]*src\s*=\s*'([^']+)'[^>]*alt\s*=\s*'([^']*)'[^>]*>", _img_repl, frag, flags=_re.IGNORECASE)
+
+        def _img_repl2(m):
+            src = (m.group(1) or '').strip()
+            alt = 'image'
+            if src.startswith('//'):
+                src_abs = 'https:' + src
+            elif src.startswith('/'):
+                src_abs = 'https://www.acmicpc.net' + src
+            else:
+                src_abs = src
+            return f"\n![{alt}]({src_abs})\n"
+
+        frag = _re.sub(r'<img[^>]*src\s*=\s*"([^"]+)"[^>]*>', _img_repl2, frag, flags=_re.IGNORECASE)
+        frag = _re.sub(r"<img[^>]*src\s*=\s*'([^']+)'[^>]*>", _img_repl2, frag, flags=_re.IGNORECASE)
+        frag = _re.sub(r'<li[^>]*>(.*?)</li>', lambda m: f"- {m.group(1).strip()}\n", frag, flags=_re.IGNORECASE | _re.DOTALL)
+        frag = _re.sub(r'<[^>]+>', '', frag)
+        frag = _html.unescape(frag).replace('\r\n', '\n').replace('\r', '\n').replace('\u00a0', ' ')
+        frag = _re.sub(r'([0-9A-Za-z]+)\s*\^\{([^}]+)\}', r'$\1^{\2}$', frag)
+        frag = _re.sub(r'([0-9A-Za-z]+)\s*_\{([^}]+)\}', r'$\1_{\2}$', frag)
+        frag = _re.sub(r'^[ \t]+', '', frag, flags=_re.MULTILINE)
+        frag = _re.sub(r'\n{3,}', '\n\n', frag)
+        frag = _re.sub(r'\n\s*([+*/=])', r' \1', frag)
+        frag = _re.sub(r'([+*/=])\s*\n', r'\1 ', frag)
+        frag = _re.sub(r'^(\s*)>(\s*)$', r'\\>\2', frag, flags=_re.MULTILINE)
+        frag = _re.sub(r'^(\s*)>\s+(?=\S)', r'\1\\> ', frag, flags=_re.MULTILINE)
+        return frag.strip('\n')
+
+    def _clean_html_block(self, fragment: str) -> str:
+        """HTML 조각을 읽기 쉬운 Markdown 형태로 변환합니다(bs4 우선 적용).
+        - **굵게**, *기울임*, ~~취소선~~을 유지합니다.
+        - <sup>/<sub>는 LaTeX 스타일로 변환: `$base^{exp}$`, `$base_{sub}$`
+        - 줄바꿈을 보존하고 들여쓰기를 제거합니다.
+        - 인라인 이미지는 절대 URL의 Markdown 이미지로 변환합니다.
+        - <ul>/<ol>/<li>를 Markdown 리스트로 변환합니다.
+        """
+        if BeautifulSoup is None:
+            return self._fallback_clean(fragment)
+
+        soup = BeautifulSoup(fragment, 'html.parser')
+        for el in soup.select('a.copy-button, a.show-spoiler, button'):
+            el.decompose()
+        for br in soup.find_all('br'):
+            br.replace_with('\n')
+        self._bs4_convert_images(soup)
+        self._bs4_convert_inline_marks(soup)
+        self._bs4_convert_sup_sub(soup)
+        self._bs4_convert_lists(soup)
+        self._bs4_convert_pre(soup)
+        text = soup.get_text(separator='\n')
+        return self._finalize_text_common(text)
+
+    def _download_problem_html(self, pid: int) -> str:
+
+        try:
+            return self._request(
+                f"https://www.acmicpc.net/problem/{pid}",
+                {
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "ko,en-US;q=0.9,en;q=0.8",
+                    "Cache-Control": "no-cache",
+                },
+            )
+        except Exception:
+            return ""
+
+    def _parse_title(self, soup, html_text: str) -> str:
+        title = ''
+        if soup:
+            t = soup.select_one('#problem_title')
+            if t:
+                title = t.get_text(strip=True)
+        if not title:
+            mt = re.search(r'<title>(.*?)</title>', html_text, re.IGNORECASE | re.DOTALL)
+            if mt:
+                title_tag = html.unescape(mt.group(1)).strip()
+                parts = re.split(r'[:\-]\s*', title_tag, maxsplit=1)
+                title = (parts[-1] if parts else title_tag).strip()
+        return title
+
+    def _parse_tier_image(self, soup) -> str:
+
+        tier_image = ''
+        if soup:
+            img = soup.select_one('img[src*="/tier/"]')
+            if img and img.get('src'):
+                tier_image = img['src']
+        if tier_image:
+            if tier_image.startswith('//'):
+                tier_image = 'https:' + tier_image
+            elif tier_image.startswith('/'):
+                tier_image = 'https://www.acmicpc.net' + tier_image
+        return tier_image
+
+    def _parse_info_table(self, soup, html_text: str) -> tuple[str, str, str, str, str, str]:
+
+        time_limit = memory_limit = submissions = accepted = solved = ratio = ''
+        if soup:
+            table = soup.select_one('#problem-info')
+            if table:
+                headers = [th.get_text(strip=True) for th in table.select('thead th')]
+                values = [td.get_text(strip=True) for td in table.select('tbody td')]
+                if headers and values and len(values) >= len(headers):
+                    for i, label in enumerate(headers):
+                        value = values[i] if i < len(values) else ''
+                        if '시간 제한' in label:
+                            time_limit = value
+                        elif '메모리 제한' in label:
+                            memory_limit = value
+                        elif '제출' in label:
+                            submissions = value
+                        elif label.strip() == '정답':
+                            accepted = value
+                        elif '맞힌 사람' in label:
+                            solved = value
+                        elif '정답 비율' in label:
+                            ratio = value
+                else:
+                    for tr in table.select('tr'):
+                        th = tr.find(['th', 'td'])
+                        tds = tr.find_all('td')
+                        label = th.get_text(strip=True) if th else ''
+                        val = tds[0].get_text(strip=True) if tds else ''
+                        if not label:
+                            continue
+                        if '시간 제한' in label and not time_limit:
+                            time_limit = val
+                        elif '메모리 제한' in label and not memory_limit:
+                            memory_limit = val
+                        elif '제출' in label and not submissions:
+                            submissions = val
+                        elif label.strip() == '정답' and not accepted:
+                            accepted = val
+                        elif '맞힌 사람' in label and not solved:
+                            solved = val
+                        elif '정답 비율' in label and not ratio:
+                            ratio = val
+        if not time_limit:
+            tl = re.search(r'시간\s*제한[^0-9]*([0-9][^<\n]*)', html_text, re.IGNORECASE)
+            time_limit = html.unescape(tl.group(1)).strip() if tl else ''
+        if not memory_limit:
+            ml = re.search(r'메모리\s*제한[^0-9]*([0-9][^<\n]*)', html_text, re.IGNORECASE)
+            memory_limit = html.unescape(ml.group(1)).strip() if ml else ''
+        if not submissions:
+            m = re.search(r'>\s*제출\s*<.*?>\s*([0-9,]+)\s*<', html_text, re.IGNORECASE | re.DOTALL)
+            submissions = m.group(1).strip() if m else submissions
+        if not accepted:
+            m = re.search(r'>\s*정답\s*<.*?>\s*([0-9,]+)\s*<', html_text, re.IGNORECASE | re.DOTALL)
+            accepted = m.group(1).strip() if m else accepted
+        if not solved:
+            m = re.search(r'>\s*맞힌\s*사람\s*<.*?>\s*([0-9,]+)\s*<', html_text, re.IGNORECASE | re.DOTALL)
+            solved = m.group(1).strip() if m else solved
+        if not ratio:
+            m = re.search(r'>\s*정답\s*비율\s*<.*?>\s*([0-9.,%]+)\s*<', html_text, re.IGNORECASE | re.DOTALL)
+            ratio = m.group(1).strip() if m else ratio
+        return time_limit, memory_limit, submissions, accepted, solved, ratio
+
+    def _collect_sections(self, soup, html_text: str) -> list[SectionDict]:
+        # BOJ 문제 본문에서 모든 섹션을 수집하고, 필요한 경우 예제 섹션을 합성한다.
+
+        if not soup:
+            # minimal legacy fallback
+            sections: list[SectionDict] = []
+
+            def _extract_node_text(sel: str) -> str:
+                m1 = re.search(rf'id\s*=\s*[\"\']{sel}[\"\'][^>]*>(.*?)</section>', html_text, re.IGNORECASE | re.DOTALL)
+                if m1:
+                    return self._clean_html_block(m1.group(1))
+                m2 = re.search(rf'id\s*=\s*[\"\']{sel}[\"\'][^>]*>(.*?)</div>', html_text, re.IGNORECASE | re.DOTALL)
+                return self._clean_html_block(m2.group(1)) if m2 else ''
+
+            for sid, title_txt in (
+                    ('problem_description', '문제'),
+                    ('problem_input', '입력'),
+                    ('problem_output', '출력'),
+                    ('problem_note', '노트'),
+            ):
+                txt = _extract_node_text(sid)
+                if txt:
+                    sections.append({'id': sid, 'title': title_txt, 'content': txt})
+            return sections
+
+        # 샘플 맵(예제 입력/출력 수집)
+        sample_inputs: dict[int, str] = {}
+        sample_outputs: dict[int, str] = {}
+
+        def _clean_pre_local(pre_el) -> str:
+            frag = str(pre_el)
+            frag = re.sub(r'<span[^>]*class=\"space-highlight\"[^>]*>\s*</span>', ' ', frag, flags=re.IGNORECASE)
+            frag = re.sub(r'<br\s*/?>', '\n', frag, flags=re.IGNORECASE)
+            frag = re.sub(r'<[^>]+>', '', frag)
+            frag = html.unescape(frag).replace('\r\n', '\n').replace('\r', '\n')
+            return frag.strip('\n')
+
+        for pre in soup.select('pre[id^="sample-input-"]'):
+            try:
+                n = int((pre.get('id') or '').split('-')[-1])
+            except Exception:
+                continue
+            sample_inputs[n] = _clean_pre_local(pre)
+        for pre in soup.select('pre[id^="sample-output-"]'):
+            try:
+                n = int((pre.get('id') or '').split('-')[-1])
+            except Exception:
+                continue
+            sample_outputs[n] = _clean_pre_local(pre)
+        handled_samples: set[int] = set()
+
+        sections: list[SectionDict] = []
+        seen: set = set()
+        sec_nodes: list = []
+        body = soup.select_one('#problem-body')
+        if body:
+            sec_nodes += body.select('section')
+        for s in soup.select('section'):
+            if s not in sec_nodes:
+                sec_nodes.append(s)
+        for sec in sec_nodes:
+            sid = sec.get('id', '')
+            # 섹션 트리 내의 인라인 예제 블록을 처리
+            m_in = re.match(r'^sampleinput(\d+)$', sid)
+            m_out = re.match(r'^sampleoutput(\d+)$', sid)
+            if m_in:
+                n = int(m_in.group(1))
+                if n not in handled_samples:
+                    in_txt = sample_inputs.get(n, '')
+                    out_txt = sample_outputs.get(n, '')
+                    content_md = ''
+                    if in_txt or out_txt:
+                        block = []
+                        block.append(f"### 예제 입력 {n}\n")
+                        block.append("```\n" + (in_txt or '') + "\n```\n")
+                        block.append(f"### 예제 출력 {n}\n")
+                        block.append("```\n" + (out_txt or '') + "\n```\n")
+                        content_md = "\n".join(block)
+                    if content_md:
+                        sections.append({'id': f'sample-{n}', 'title': '예제', 'content': content_md.rstrip()})
+                        handled_samples.add(n)
+                continue
+            if m_out:
+                n = int(m_out.group(1))
+                if n in handled_samples:
+                    continue
+            # 메모/에디터 UI 및 display:none 섹션은 제외
+            if sec.select_one('#problem-memo-view, #memo-content, .editor-toolbar'):
+                continue
+            style = (sec.get('style') or '').lower()
+            if 'display:none' in style:
+                continue
+            h2 = sec.select_one('.headline h2')
+            title_txt = h2.get_text(strip=True) if h2 else (sid or '섹션')
+            content_md = self._section_to_markdown(sec).rstrip()
+            key = (sid, title_txt, hash(content_md))
+            if not content_md or key in seen:
+                continue
+            seen.add(key)
+            sections.append({'id': sid, 'title': title_txt, 'content': content_md})
+        return sections
+
+    def _fetch_tags_and_level(self, pid: int) -> tuple[list[str], int]:
+        tags: list[str] = []
+        level = 0
+        try:
+            data = self._request(
+                SOLVEDAC_URL.format(pid=pid),
+                {
+                    "User-Agent": "ps-boj-helper/1.1 (+https://github.com/rhseung/ps)",
+                    "Accept": "application/json",
+                },
+            )
+            obj = json.loads(data)
+            # level
+            try:
+                level = int(obj.get("level", 0))
+            except Exception:
+                level = 0
+            # tags: prefer Korean displayNames
+            try:
+                tag_objs = obj.get("tags") or []
+                for t in tag_objs:
+                    dn = t.get("displayNames") or []
+                    # find Korean name first
+                    ko = next((d.get("name") for d in dn if (d.get("language") == "ko" and d.get("name"))), None)
+                    if ko:
+                        tags.append(ko)
+                        continue
+                    # fallback to any non-empty display name
+                    any_name = next((d.get("name") for d in dn if d.get("name")), None)
+                    if any_name:
+                        tags.append(any_name)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # de-duplicate while preserving order
+        seen = set()
+        tags = [x for x in tags if not (x in seen or seen.add(x))]
+        return tags, level
+
+    def fetch_full_details(self, pid: int) -> dict:
+        """BOJ 문제 페이지를 크롤링하여 구조화된 dict로 반환합니다.
+        필드가 없을 경우 빈 문자열을 반환하며, 다양한 DOM 변형에도 최대한 견고하게 동작합니다."""
+        html_text = self._download_problem_html(pid)
+        soup = BeautifulSoup(html_text, 'html.parser') if BeautifulSoup else None
+        title = self._parse_title(soup, html_text)
+        tier_image = self._parse_tier_image(soup)
+        time_limit, memory_limit, submissions, accepted, solved, ratio = self._parse_info_table(soup, html_text)
+        sections = self._collect_sections(soup, html_text)
+        tags, level = self._fetch_tags_and_level(pid)
+        if not tier_image and level:
+            tier_image = f"https://static.solved.ac/tier_small/{level}.svg"
+        # samples kept for Runner/save; may be re-fetched by caller
+        try:
+            samples = self.fetch_samples(pid)
+        except Exception:
+            samples = []
+        return {
+            "title": title,
+            "tier_image": tier_image,
+            "time_limit": time_limit,
+            "memory_limit": memory_limit,
+            "submissions": submissions,
+            "accepted": accepted,
+            "solved": solved,
+            "ratio": ratio,
+            "samples": samples,
+            "tags": tags,
+            "sections": sections,
+        }
+
+    def to_markdown(self, pid: int, details: dict) -> str:
+        def esc(s: str) -> str:
+            return s if s is not None else ""
+
+        title = esc(details.get("title", "")).strip() or f"BOJ {pid}"
+        tier_md = f'<img src="{details["tier_image"]}" width="20px" />' if details.get("tier_image") else ""
+        md = []
+        md.append(f"# {pid}. [{title}](https://www.acmicpc.net/problem/{pid})")
+        md.append("")
+        md.append("| 티어 | 시간 제한 | 메모리 제한 | 제출 | 정답 | 맞힌 사람 | 정답 비율 |\n|---|---|---|---:|---:|---:|---:|")
+        md.append(
+            f"| {tier_md} | {esc(details.get('time_limit', ''))} | {esc(details.get('memory_limit', ''))} | {esc(details.get('submissions', ''))} | {esc(details.get('accepted', ''))} | {esc(details.get('solved', ''))} | {esc(details.get('ratio', ''))} |")
+        md.append("\n---\n")
+        # Render sections: generic when available
+        if details.get('sections'):
+            for sec in details['sections']:
+                title_txt = sec.get('title') or '섹션'
+                content_md = sec.get('content') or ''
+                md.append(f"## {title_txt}\n")
+                md.append(content_md.rstrip() + "\n")
+        else:
+            # Legacy fallback (older cached results)
+            if details.get('description'):
+                md.append("## 문제\n")
+                md.append(esc(details['description']).rstrip() + "\n")
+            if details.get('input'):
+                md.append("## 입력\n")
+                md.append(esc(details['input']).rstrip() + "\n")
+            if details.get('output'):
+                md.append("## 출력\n")
+                md.append(esc(details['output']).rstrip() + "\n")
+            if details.get('notes'):
+                md.append("## 노트\n")
+                md.append(esc(details['notes']).rstrip() + "\n")
+        # If crawling didn't include a tag section, but solved.ac provided tags, append them here
+        has_tag_section = False
+        for sec in details.get('sections') or []:
+            sid = (sec.get('id') or '').lower()
+            title_txt = (sec.get('title') or '')
+            if sid.startswith('problem_tags') or '알고리즘 분류' in title_txt:
+                has_tag_section = True
+                break
+        solvedac_tags = [t for t in details.get('tags') or [] if isinstance(t, str) and t.strip()]
+        if (not has_tag_section) and solvedac_tags:
+            md.append("## 알고리즘 분류\n")
+            for t in solvedac_tags:
+                md.append(f"- {t.strip()}")
+            md.append("")
+        # (Samples are now inlined as sections with title '예제', so do not render separately)
+        # Tags: no special handling; rely on crawled sections (e.g., <section id="problem_tags">)
+        return "\n".join(md)
 
     def __init__(self, cafile: Optional[str] = _CAFILE):
         self.cafile = cafile
@@ -342,7 +794,7 @@ class ProblemFetcher:
             html_text = self._request(
                 f"https://www.acmicpc.net/problem/{pid}",
                 {
-                    "User-Agent": "ps-boj-helper/1.1 (+https://github.com/hoony6134/ps)",
+                    "User-Agent": "ps-boj-helper/1.1 (+https://github.com/rhseung/ps)",
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 },
             )
@@ -363,76 +815,7 @@ class ProblemFetcher:
 
         return None
 
-    def fetch_meta(self, pid: int) -> dict:
-        try:
-            data = self._request(
-                SOLVEDAC_URL.format(pid=pid),
-                {
-                    "User-Agent": "ps-boj-helper/1.1 (+https://github.com/rhseung/ps)",
-                    "Accept": "application/json",
-                },
-            )
-            obj = json.loads(data)
-            title = obj.get("titleKo") or obj.get("titleEn") or obj.get("title")
-            tier = obj.get("level")  # solved.ac uses `level`; we display as tier
-            tier_name = resolve_algo_tier(tier)
-            tier_color = resolve_algo_color(tier)
-            tier_badge_url = resolve_tier_badge_url(tier)
-            # Generic tags (names)
-            tags = []
-            tag_objs = obj.get("tags")
-            tags_ko = []
-            if isinstance(tag_objs, list):
-                for tag in tag_objs:
-                    display_names = tag.get("displayNames", [])
-                    # Prefer Korean, fallback to first
-                    name = None
-                    name_ko = None
-                    for dn in display_names:
-                        if dn.get("language") == "ko":
-                            name_ko = dn.get("name")
-                            break
-                    if not name_ko and display_names:
-                        name_ko = display_names[0].get("name")
-                    if name_ko:
-                        tags_ko.append(name_ko)
-                    # For generic tags, just use the first display name if present
-                    if display_names:
-                        name = display_names[0].get("name")
-                        if name:
-                            tags.append(name)
-            url_solved = f"https://solved.ac/problems?page=1&query={pid}"
-            # Hashtag string: "#수학 #기하학" (remove spaces in tag names)
-            tags_hashtags = " ".join("#" + re.sub(r"\s+", "", t) for t in tags_ko)
-            return {
-                "tier": tier,
-                "tier_name": tier_name,
-                "tier_color": tier_color,
-                "tier_badge_url": tier_badge_url,
-                "title": title,
-                "titleKo": obj.get("titleKo"),
-                "titleEn": obj.get("titleEn"),
-                "tags": tags,
-                "tags_ko": tags_ko,
-                "tags_hashtags": tags_hashtags,
-                "url_solved": url_solved,
-                "acceptedUserCount": obj.get("acceptedUserCount"),
-                "averageTries": obj.get("averageTries"),
-                "isSolvable": obj.get("isSolvable"),
-                "titles": obj.get("titles") if "titles" in obj else None,
-            }
-        except Exception:
-            return {}
-
     def fetch_samples(self, pid: int) -> list[tuple[str, str]]:
-        """Return list of (input, output) sample pairs from BOJ page.
-        Strategy (handle as many DOM variants as possible):
-          A) Primary: <pre id="sample-input-N"> / <pre id="sample-output-N">
-          B) Variants: allow <div> instead of <pre> and any order of attributes
-          C) Legacy: <section id="sampleinputN"> / <section id="sampleoutputN"> with <pre class="sampledata">
-          D) Fallback: headings <h[1-6]>예제 입력 N</h[1-6]> followed by <pre>
-        Cleans HTML spans (e.g., space-highlight), converts <br> to newlines, preserves spaces/newlines.
-        """
 
         def _log(msg: str) -> None:
             if getattr(self, "debug", False):
@@ -481,83 +864,129 @@ class ProblemFetcher:
                 print(f"[fetch_samples:{pid}] request failed: {e}")
             return []
 
+        soup = BeautifulSoup(html_text, 'html.parser') if BeautifulSoup else None
+
         def _clean_pre(fragment: str) -> str:
-            # Replace explicit space markers (e.g., used to visualize spaces)
+            # 시각화용 공백 마커(span.space-highlight)를 실제 공백으로 교체
             frag = re.sub(r'<span[^>]*class=\"space-highlight\"[^>]*>\s*</span>', ' ', fragment, flags=re.IGNORECASE)
-            # Convert <br> to newlines
+            # <br>을 줄바꿈으로 치환
             frag = re.sub(r'<br\s*/?>', '\n', frag, flags=re.IGNORECASE)
-            # Drop remaining tags but keep text
+            # 남은 태그 제거(텍스트만 유지)
             frag = re.sub(r'<[^>]+>', '', frag)
-            # Unescape HTML entities
+            # HTML 엔티티 해제
             frag = html.unescape(frag)
-            # Normalise newlines; keep trailing spaces, trim only trailing newlines
+            # 개행 정규화; 내용은 유지하고 마지막 개행만 제거
             frag = frag.replace('\r\n', '\n').replace('\r', '\n')
             return frag.strip('\n')
 
         def _preview(s: str, n: int = 80) -> str:
             s = s.replace('\n', '\\n')
-            return (s[:n] + ('…' if len(s) > n else ''))
+            return s[:n] + ('…' if len(s) > n else '')
 
-        # Collector util that merges input/output maps into ordered pairs
+        # 입력/출력 맵을 쌍 리스트로 병합하는 유틸
         def _pairs_from_maps(inp_map: dict[int, str], out_map: dict[int, str]) -> list[tuple[str, str]]:
             out: list[tuple[str, str]] = []
             for k in sorted(set(inp_map) & set(out_map)):
                 out.append((inp_map[k], out_map[k]))
             return out
 
-        # --- Primary: strictly <pre id="sample-input-N"> / <pre id="sample-output-N">
         inputs: dict[int, str] = {}
         outputs: dict[int, str] = {}
-        for m in re.finditer(r'<pre[^>]*id\s*=\s*[\"\']sample-input-(\d+)[\"\'][^>]*>(.*?)</pre>', html_text, re.DOTALL | re.IGNORECASE):
-            inputs[int(m.group(1))] = _clean_pre(m.group(2))
-        for m in re.finditer(r'<pre[^>]*id\s*=\s*[\"\']sample-output-(\d+)[\"\'][^>]*>(.*?)</pre>', html_text, re.DOTALL | re.IGNORECASE):
-            outputs[int(m.group(1))] = _clean_pre(m.group(2))
-        _log(f"primary <pre> ids: inputs={len(inputs)}, outputs={len(outputs)}")
+        if soup:
+            for pre in soup.select('pre[id^="sample-input-"]'):
+                try:
+                    n = int((pre.get('id') or '').split('-')[-1])
+                except Exception:
+                    continue
+                inputs[n] = _clean_pre(str(pre))
+            for pre in soup.select('pre[id^="sample-output-"]'):
+                try:
+                    n = int((pre.get('id') or '').split('-')[-1])
+                except Exception:
+                    continue
+                outputs[n] = _clean_pre(str(pre))
+        else:
+            for m in re.finditer(r'<pre[^>]*id\s*=\s*[\"\']sample-input-(\d+)[\"\'][^>]*>(.*?)</pre>', html_text,
+                                 re.DOTALL | re.IGNORECASE):
+                inputs[int(m.group(1))] = _clean_pre(m.group(2))
+            for m in re.finditer(r'<pre[^>]*id\s*=\s*[\"\']sample-output-(\d+)[\"\'][^>]*>(.*?)</pre>', html_text,
+                                 re.DOTALL | re.IGNORECASE):
+                outputs[int(m.group(1))] = _clean_pre(m.group(2))
+        _log(f"primary <pre> ids: inputs={len(inputs)}, outputs={len(outputs)}")  # 기본 <pre> 아이디
         pairs = _pairs_from_maps(inputs, outputs)
         if not pairs and getattr(self, "debug", False):
-            # Dump a tiny snippet around the first occurrence of 'sample-input' to help debug
+            # 디버그: sample-* 부근 HTML 일부를 덤프
             mm = re.search(r'sample-(?:input|output)-', html_text)
             if mm:
                 s = max(0, mm.start() - 200)
                 e = min(len(html_text), mm.end() + 240)
                 print(f"[fetch_samples:{pid}] debug snippet (around sample-):\n" + html_text[s:e])
         if pairs:
-            _log(f"matched primary <pre>: {len(pairs)} pair(s)")
+            _log(f"기본 <pre> 매칭 완료: {len(pairs)} pair(s)")
             for i, (a, b) in enumerate(pairs, 1):
                 _log(f"  sample #{i} in: '{_preview(a)}' | out: '{_preview(b)}'")
             return pairs
-
-        # --- C) Legacy section ids sampleinputN / sampleoutputN with <pre class="sampledata">
         inputs.clear()
         outputs.clear()
-        for m in re.finditer(
-                r'<section[^>]*id\s*=\s*[\"\']sampleinput(\d+)[\"\'][^>]*>.*?<pre[^>]*class\s*=\s*[\"\'][^\"\']*\bsampledata\b[^\"\']*[\"\'][^>]*>(.*?)</pre>',
-                html_text, re.DOTALL | re.IGNORECASE):
-            inputs[int(m.group(1))] = _clean_pre(m.group(2))
-        for m in re.finditer(
-                r'<section[^>]*id\s*=\s*[\"\']sampleoutput(\d+)[\"\'][^>]*>.*?<pre[^>]*class\s*=\s*[\"\'][^\"\']*\bsampledata\b[^\"\']*[\"\'][^>]*>(.*?)</pre>',
-                html_text, re.DOTALL | re.IGNORECASE):
-            outputs[int(m.group(1))] = _clean_pre(m.group(2))
-        _log(f"legacy sections: inputs={len(inputs)}, outputs={len(outputs)}")
+        if soup:
+            for sec in soup.select('section[id^="sampleinput"]'):
+                try:
+                    n = int((sec.get('id') or '')[len('sampleinput'):])
+                except Exception:
+                    continue
+                pre = sec.select_one('pre.sampledata') or sec.find('pre')
+                if pre:
+                    inputs[n] = _clean_pre(str(pre))
+            for sec in soup.select('section[id^="sampleoutput"]'):
+                try:
+                    n = int((sec.get('id') or '')[len('sampleoutput'):])
+                except Exception:
+                    continue
+                pre = sec.select_one('pre.sampledata') or sec.find('pre')
+                if pre:
+                    outputs[n] = _clean_pre(str(pre))
+        else:
+            for m in re.finditer(
+                    r'<section[^>]*id\s*=\s*[\"\']sampleinput(\d+)[\"\'][^>]*>.*?<pre[^>]*class\s*=\s*[\"\'][^\"\']*\bsampledata\b[^\"\']*[\"\'][^>]*>(.*?)</pre>',
+                    html_text, re.DOTALL | re.IGNORECASE):
+                inputs[int(m.group(1))] = _clean_pre(m.group(2))
+            for m in re.finditer(
+                    r'<section[^>]*id\s*=\s*[\"\']sampleoutput(\d+)[\"\'][^>]*>.*?<pre[^>]*class\s*=\s*[\"\'][^\"\']*\bsampledata\b[^\"\']*[\"\'][^>]*>(.*?)</pre>',
+                    html_text, re.DOTALL | re.IGNORECASE):
+                outputs[int(m.group(1))] = _clean_pre(m.group(2))
+        _log(f"레거시 섹션 패턴: inputs={len(inputs)}, outputs={len(outputs)}")
         pairs = _pairs_from_maps(inputs, outputs)
         if pairs:
-            _log(f"matched legacy sections: {len(pairs)} pair(s)")
+            _log(f"레거시 섹션 매칭 완료: {len(pairs)} pair(s)")
             for i, (a, b) in enumerate(pairs, 1):
                 _log(f"  sample #{i} in: '{_preview(a)}' | out: '{_preview(b)}'")
             return pairs
-
-        # --- D) Fallback: headings 예제 입력/출력 N with arbitrary heading level and following <pre>
         blocks: list[tuple[str, int, str]] = []
-        for m in re.finditer(r'<h[1-6][^>]*>\s*([^<]*?)\s*(\d+)\s*<\/h[1-6]>\s*<pre[^>]*>(.*?)<\/pre>', html_text,
-                             re.DOTALL | re.IGNORECASE):
-            label_raw = html.unescape(m.group(1)).strip().lower()
-            idx = int(m.group(2))
-            txt = _clean_pre(m.group(3))
-            if '입력' in label_raw or 'input' in label_raw:
-                blocks.append(('input', idx, txt))
-            elif '출력' in label_raw or 'output' in label_raw:
-                blocks.append(('output', idx, txt))
-        _log(f"fallback headings blocks collected: {len(blocks)}")
+        if soup:
+            for h in soup.select('h1, h2, h3, h4, h5, h6'):
+                txt = (h.get_text(" ", strip=True) or "").lower()
+                m = re.search(r'(입력|input|출력|output)\s*(\d+)', txt)
+                if not m:
+                    continue
+                kind_ko = m.group(1)
+                idx = int(m.group(2))
+                pre = h.find_next('pre')
+                if not pre:
+                    continue
+                text = _clean_pre(str(pre))
+                kind = 'input' if ('입력' in kind_ko or 'input' in kind_ko) else 'output'
+                blocks.append((kind, idx, text))
+        else:
+            for m in re.finditer(r'<h[1-6][^>]*>\s*([^<]*?)\s*(\d+)\s*</h[1-6]>\s*<pre[^>]*>(.*?)</pre>', html_text,
+                                 re.DOTALL | re.IGNORECASE):
+                label_raw = html.unescape(m.group(1)).strip().lower()
+                idx = int(m.group(2))
+                txt = _clean_pre(m.group(3))
+                if '입력' in label_raw or 'input' in label_raw:
+                    blocks.append(('input', idx, txt))
+                elif '출력' in label_raw or 'output' in label_raw:
+                    blocks.append(('output', idx, txt))
+        _log(f"폴백: 헤딩 기반 블록 수집: {len(blocks)}")
         if blocks:
             in_map: dict[int, str] = {}
             out_map: dict[int, str] = {}
@@ -565,16 +994,15 @@ class ProblemFetcher:
                 (in_map if kind == 'input' else out_map)[idx] = txt
             pairs = _pairs_from_maps(in_map, out_map)
             if pairs:
-                _log(f"matched heading fallback: {len(pairs)} pair(s)")
+                _log(f"헤딩 폴백 매칭 완료: {len(pairs)} pair(s)")
                 for i, (a, b) in enumerate(pairs, 1):
                     _log(f"  sample #{i} in: '{_preview(a)}' | out: '{_preview(b)}'")
                 return pairs
-
-        _log("no sample pairs found after all strategies")
+        _log("모든 전략 실패: 샘플 쌍을 찾지 못함")
         return []
 
 
-# ================================ CMake editor ================================
+# ================================ CMake 편집기 ================================
 class CMakePS:
     _PS_CALL_RE = re.compile(r"add_executable\s*\(\s*ps\b", re.IGNORECASE)
 
@@ -582,6 +1010,7 @@ class CMakePS:
         self.path = cmakelists
 
     def _find_ps_block(self, text: str) -> tuple[int, int, str]:
+        # add_executable(ps ...) 블록의 위치와 들여쓰기를 찾음
         m = self._PS_CALL_RE.search(text)
         if not m:
             raise SystemExit("add_executable(ps ...) not found in CMakeLists.txt")
@@ -607,6 +1036,7 @@ class CMakePS:
 
     @staticmethod
     def _parse_sources(inside: str) -> List[str]:
+        # add_executable 블록 내부에서 소스 파일 목록을 파싱
         tokens = re.findall(r'"[^"\n]+"|[^\s\n]+', inside)
         if not tokens:
             return []
@@ -631,6 +1061,7 @@ class CMakePS:
 
     @staticmethod
     def _rebuild(indent: str, sources: Iterable[str]) -> str:
+        # add_executable 블록을 다시 만듦
         inner_indent = indent + "    "
         body = "\n".join(f"{inner_indent}\"{src}\"" for src in sources)
         return f"{indent}add_executable(ps\n{body}\n{indent})"
@@ -671,6 +1102,7 @@ class Git:
         self.cwd = cwd
 
     def run(self, *args: str) -> None:
+        # 지정된 인자와 함께 git 명령어를 실행
         subprocess.check_call(["git", *args], cwd=self.cwd)
 
 
@@ -680,7 +1112,7 @@ class Runner:
         self.cfg = cfg
 
     def _guess_build_dir(self) -> Path:
-        # prefer ./build then common cmake dirs
+        # 우선순위: ./build, 그 다음 cmake 빌드 디렉터리들
         candidates = [self.repo.root / "build"]
         candidates += sorted(self.repo.root.glob("cmake-build-*"))
         for c in candidates:
@@ -689,37 +1121,39 @@ class Runner:
         return self.repo.root / "build"
 
     def resolve_bin(self) -> Path:
+        # ps 바이너리(실행 파일) 경로를 추정
         build_dir = self._guess_build_dir()
         exe = "ps.exe" if os.name == "nt" else "ps"
 
-        # Config may be a dir or a full path; resolve ${CMAKE_BINARY_DIR}
+        # 설정은 디렉터리 또는 전체 경로일 수 있음; ${CMAKE_BINARY_DIR}를 실제 경로로 치환
         run_dir_cfg = self.cfg.get("run_dir", "${CMAKE_BINARY_DIR}/bin")
         run_dir_resolved = run_dir_cfg.replace("${CMAKE_BINARY_DIR}", str(build_dir))
 
         candidates: list[Path] = []
         p_cfg = Path(run_dir_resolved)
         if p_cfg.suffix == "" and p_cfg.name != exe:
-            # looks like a directory; append exe under it
+            # 디렉터리로 보이면 그 하위에 실행 파일을 붙임
             candidates.append(p_cfg / exe)
         else:
-            # looks like a file path already
+            # 이미 파일 경로로 보임
             candidates.append(p_cfg)
 
-        # Common CMake output patterns
-        candidates.append(build_dir / exe)  # e.g., cmake-build-debug/ps (user case)
-        candidates.append(build_dir / "bin" / exe)  # e.g., build/bin/ps
+        # CMake의 일반적인 출력 경로들 추가
+        candidates.append(build_dir / exe)  # 예: cmake-build-debug/ps
+        candidates.append(build_dir / "bin" / exe)  # 예: build/bin/ps
         for sub in ("Debug", "Release", "RelWithDebInfo", "MinSizeRel"):
             candidates.append(build_dir / sub / exe)
 
-        # First existing wins
+        # 존재하는 첫 번째 경로 반환
         for c in candidates:
             if c.exists():
                 return c
 
-        # Fallback to the first candidate even if missing (for helpful error path)
+        # 없으면 첫 번째 후보 반환(오류 메시지용)
         return candidates[0]
 
     def run_cases(self, bin_path: Path, cases: list[tuple[str, str]]) -> list[dict]:
+        # 바이너리에 대해 각 샘플 케이스를 실행
         results = []
         for i, (inp, expected) in enumerate(cases, 1):
             start = subprocess.time.time() if hasattr(subprocess, 'time') else __import__('time').time()
@@ -739,63 +1173,28 @@ class Runner:
             })
         return results
 
-    def run_cases_argv(self, argv: list[str], cases: list[tuple[str, str]]) -> list[dict]:
-        results = []
-        for i, (inp, expected) in enumerate(cases, 1):
-            start = subprocess.time.time() if hasattr(subprocess, 'time') else __import__('time').time()
-            proc = subprocess.run(argv, input=inp, text=True, capture_output=True)
-            dur_ms = int(((__import__('time').time() - start) * 1000))
-            out = proc.stdout.rstrip("\n")
-            exp = expected.rstrip("\n")
-            ok = (proc.returncode == 0) and (out == exp)
-            results.append({
-                "idx": i,
-                "ok": ok,
-                "exit": proc.returncode,
-                "ms": dur_ms,
-                "expected": exp,
-                "actual": out,
-                "stderr": proc.stderr,
-            })
-        return results
 
-
-# ================================== Core =====================================
+# ================================== 코어 =====================================
 class BOJHelper:
-    def _write_markdown(self, pid: int, name: str) -> Path:
-        """
-        Write markdown doc for problem `pid` and return the Path.
-        """
-        from datetime import datetime
-        meta = self.fetcher.fetch_meta(pid)
-        boj_url = f"https://www.acmicpc.net/problem/{pid}"
-        solved_url = meta.get("url_solved") or f"https://solved.ac/problems?page=1&query={pid}"
-        title = name or meta.get("title") or f"BOJ {pid}"
-        doc_dir = self.paths.root / "docs" / "boj"
-        doc_dir.mkdir(parents=True, exist_ok=True)
-        md_path = doc_dir / f"{pid} - {sanitize_filename(title)}.md"
 
-        # Compose tag fields
-        tags_ko = meta.get("tags_ko", meta.get("tags", []))
-        hashtags = meta.get("tags_hashtags", "")
+    def markdown(self, pid: int, out_path: Optional[str]) -> Path:
+        details = self.fetcher.fetch_full_details(pid)
+        if not details.get("samples"):
+            try:
+                details["samples"] = self.fetcher.fetch_samples(pid)
+            except Exception:
+                details["samples"] = []
+        md = self.fetcher.to_markdown(pid, details)
+        # resolve output
+        if out_path:
+            outp = (self.paths.root / out_path).resolve()
+        else:
+            outp = (self.paths.root / "docs" / "boj" / f"{pid}.md").resolve()
+        outp.parent.mkdir(parents=True, exist_ok=True)
+        outp.write_text(md + "\n", encoding="utf-8")
+        print(f"{L.OK} markdown written: {outp.relative_to(self.paths.root)}")
+        return outp
 
-        md = f"""# BOJ {pid} — {title}  
-<img src="{meta.get('tier_badge_url', 'https://d2gd6pc034wcta.cloudfront.net/tier/0.svg')}" alt="tier" style="height:1.05em; vertical-align:-0.2em; margin-right:0.25em;" /> <span style="color:{meta.get('tier_color', '#818996')}; font-weight:600">{meta.get('tier_name', 'Unrated')}</span> <br />
-[BOJ]({boj_url}) · [solved.ac]({solved_url})
-
-## Information
-> Fetched at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  
-> {hashtags}
-
-- Is Solvable: {meta.get('isSolvable', 'N/A')}
-- Accepted Users: {meta.get('acceptedUserCount', 'N/A')}
-- Average Tries: {meta.get('averageTries', 'N/A')}
-
-## Notes
-(풀이 아이디어, 복잡도, 구현 이슈 등을 기록하세요.)
-"""
-        md_path.write_text(md, encoding='utf-8')
-        return md_path
     def __init__(self, paths: RepoPaths):
         self.paths = paths
         self.config = Config(paths)
@@ -812,8 +1211,9 @@ class BOJHelper:
 
     # ----------------------------- start command -----------------------------
     def start(self, pid: int, name: Optional[str], lang: Optional[str]) -> None:
-        lang = (lang or self.config.get("lang", "cpp")).lower()
+        lang = (lang or self.config.get("lang", "py")).lower()
 
+        # Resolve title if not provided
         if not name:
             fetched = self.fetcher.fetch(pid)
             if fetched:
@@ -823,78 +1223,114 @@ class BOJHelper:
                 name = f"BOJ {pid}"
                 print(f"{L.WARN} could not fetch title; using placeholder")
 
-        # Write markdown doc at start time
-        md_path = self._write_markdown(pid, name)
-        print(f"{L.OK} doc created: {md_path.relative_to(self.paths.root)}")
+        # Create per-problem directory under solving/: "<pid> - <name>/"
+        dir_name = f"{pid} - {sanitize_filename(name)}"
+        prob_dir = self.paths.solving / dir_name
+        prob_dir.mkdir(parents=True, exist_ok=True)
 
-        fname = f"{pid} - {sanitize_filename(name)}.{lang}"
-        dst = self.paths.solving / fname
-        dst.parent.mkdir(parents=True, exist_ok=True)
-
-        if not dst.exists():
-            dst.write_text(self._lang_template(lang).format(id=pid, name=name), encoding="utf-8")
-            print(f"{L.OK} created: {dst.relative_to(self.paths.root)}")
+        # Create source file inside the directory
+        src_fname = f"{dir_name}.{lang}"
+        src_path = prob_dir / src_fname
+        if not src_path.exists():
+            src_path.write_text(self._lang_template(lang).format(id=pid, name=name), encoding="utf-8")
+            print(f"{L.OK} created: {src_path.relative_to(self.paths.root)}")
         else:
-            print(f"{L.SKIP} exists: {dst.relative_to(self.paths.root)}")
+            print(f"{L.SKIP} exists: {src_path.relative_to(self.paths.root)}")
 
-        rel_src = self._rel(dst)
+        # Generate Markdown inside the same directory as README.md
+        try:
+            details = self.fetcher.fetch_full_details(pid)
+            if not details.get("samples"):
+                try:
+                    details["samples"] = self.fetcher.fetch_samples(pid)
+                except Exception:
+                    details["samples"] = []
+            md_text = self.fetcher.to_markdown(pid, details)
+            md_path = prob_dir / "README.md"
+            md_path.write_text(md_text + "\n", encoding="utf-8")
+            print(f"{L.OK} markdown written: {md_path.relative_to(self.paths.root)}")
+        except Exception as e:
+            print(f"{L.WARN} failed to write markdown: {e}")
+
+        # Add C++ source into CMake target if cpp
+        rel_src = self._rel(src_path)
         if lang == "cpp":
             self.cmake.add(rel_src)
             print(f"{L.OK} added to ps target: {rel_src}")
         else:
             print(f"{L.HINT} python source created; not added to CMake target: {rel_src}")
 
+        # Change current working directory to the new problem directory
+        try:
+            os.chdir(prob_dir)
+            print(f"{L.HINT} Changed working directory to: {prob_dir}")
+        except Exception as e:
+            print(f"{L.WARN} Failed to change working directory: {e}")
+
     # ---------------------------- finish command -----------------------------
     def finish(self, pid: int, name: Optional[str], lang: Optional[str], push: bool, no_git: bool) -> None:
-        lang = (lang or self.config.get("lang", "cpp")).lower()
+        lang = (lang or self.config.get("lang", "py")).lower()
 
-        # locate source in solving/
-        src: Optional[Path] = None
+        # Locate per-problem directory under solving/
+        prob_dir: Optional[Path] = None
         if name:
-            candidate = self.paths.solving / f"{pid} - {sanitize_filename(name)}.{lang}"
-            if candidate.exists():
-                src = candidate
-        if src is None:
-            cand = sorted(self.paths.solving.glob(f"{pid} -*.{lang}"))
+            candidate = self.paths.solving / f"{pid} - {sanitize_filename(name)}"
+            if candidate.exists() and candidate.is_dir():
+                prob_dir = candidate
+        if prob_dir is None:
+            cand = sorted(self.paths.solving.glob(f"{pid} -*"))
             if cand:
-                src = cand[0]
-                if not name:
-                    try:
-                        name = src.stem.split(" - ", 1)[1]
-                    except Exception:
-                        pass
-        if src is None:
+                prob_dir = next((p for p in cand if p.is_dir()), None)
+
+        if prob_dir is None:
+            # Fallback: try to infer from a source file (legacy layout)
             if not name:
                 name = self.fetcher.fetch(pid) or f"BOJ {pid}"
-            src = self.paths.solving / f"{pid} - {sanitize_filename(name)}.{lang}"
-            if not src.exists():
-                raise SystemExit(f"Source not found: {src}")
+            legacy_src = self.paths.solving / f"{pid} - {sanitize_filename(name)}.{lang}"
+            if legacy_src.exists():
+                # Promote legacy file into a dir for consistency
+                prob_dir = self.paths.solving / f"{pid} - {sanitize_filename(name)}"
+                prob_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(legacy_src), str(prob_dir / legacy_src.name))
+                print(f"{L.HINT} migrated legacy file into directory: {prob_dir.relative_to(self.paths.root)}")
 
-        if not name:
-            # last-ditch best-effort name
-            try:
-                name = src.stem.split(" - ", 1)[1]
-            except Exception:
-                name = self.fetcher.fetch(pid) or f"BOJ {pid}"
+        if prob_dir is None:
+            raise SystemExit(f"Problem directory not found for id={pid}. Try providing a name or ensure it exists under solving/")
 
-        rel_src = self._rel(src)
+        # Determine the primary source file path for CMake removal (cpp only)
+        src_path = None
         if lang == "cpp":
+            # pick the first .cpp in the directory whose basename contains "<pid} -"
+            cpp_list = sorted(prob_dir.glob("*.cpp"))
+            if cpp_list:
+                # Prefer file named "<pid> - <name>.cpp"
+                prefer = f"{pid} - "
+                src_path = next((p for p in cpp_list if p.name.startswith(prefer)), cpp_list[0])
+
+        # Remove from CMake if needed
+        if lang == "cpp" and src_path is not None:
+            rel_src = self._rel(src_path)
             self.cmake.remove(rel_src)
             print(f"{L.OK} removed from ps target: {rel_src}")
-        else:
-            print(f"{L.HINT} python source; nothing to remove from CMake: {rel_src}")
+        elif lang == "cpp":
+            print(f"{L.WARN} no .cpp found under: {prob_dir.relative_to(self.paths.root)}")
 
+        # Move the entire problem directory into the thousand-range folder
         dst_dir = self.paths.root / thousand_folder(pid)
         dst_dir.mkdir(exist_ok=True)
-        dst = dst_dir / src.name
-        shutil.move(str(src), str(dst))
+        dst = dst_dir / prob_dir.name
+        if dst.exists():
+            # If target exists, move contents over (simple merge)
+            for item in prob_dir.iterdir():
+                shutil.move(str(item), str(dst / item.name))
+            shutil.rmtree(prob_dir)
+        else:
+            shutil.move(str(prob_dir), str(dst))
         print(f"{L.OK} moved to: {dst.relative_to(self.paths.root)}")
-
-        # Markdown doc is now created at start, not here.
 
         if not no_git:
             self.git.run("add", "-A")
-            msg = f"feat(boj/solve): #{pid} - {name}"
+            msg = f"solve: {pid} - {name or prob_dir.name.split(' - ', 1)[-1]}"
             self.git.run("commit", "-m", msg)
             print(f"{L.OK} committed: {msg}")
             if push:
@@ -903,190 +1339,37 @@ class BOJHelper:
 
     # ---------------------------- delete command -----------------------------
     def delete(self, pid: int, name: Optional[str], lang: Optional[str]) -> None:
-        """Remove the file from the ps target **without** deleting the code or committing.
-        - If `name` is omitted, try to resolve it similarly to `finish`.
-        - Prefer files under `solving/`, but fall back to the first match anywhere if needed.
-        """
-        lang = (lang or self.config.get("lang", "cpp")).lower()
+        lang = (lang or self.config.get("lang", "py")).lower()
 
-        # Try to locate the source file (prefer solving/)
-        src: Optional[Path] = None
+        # Try to locate the problem directory (prefer solving/)
+        prob_dir: Optional[Path] = None
         if name:
-            candidate = self.paths.solving / f"{pid} - {sanitize_filename(name)}.{lang}"
-            if candidate.exists():
-                src = candidate
-        if src is None:
-            # Prefer solving/ if possible
-            cand_solving = sorted(self.paths.solving.glob(f"{pid} -*.{lang}"))
-            if cand_solving:
-                src = cand_solving[0]
-        if src is None:
-            # As a fallback, search repo (shallow) for any match
-            cand_any = sorted(self.paths.root.glob(f"**/{pid} -*.{lang}"))
-            if cand_any:
-                src = cand_any[0]
-        if src is None:
-            # If still unknown and name was omitted, best-effort name fetch
-            if not name:
-                fetched = self.fetcher.fetch(pid)
-                if fetched:
-                    name = fetched
-                    candidate = self.paths.solving / f"{pid} - {sanitize_filename(name)}.{lang}"
-                    if candidate.exists():
-                        src = candidate
-        if src is None:
-            raise SystemExit(f"Source not found for id={pid}. Try providing a name or --lang.")
+            candidate = self.paths.solving / f"{pid} - {sanitize_filename(name)}"
+            if candidate.exists() and candidate.is_dir():
+                prob_dir = candidate
+        if prob_dir is None:
+            cand_solving = sorted(self.paths.solving.glob(f"{pid} -*"))
+            prob_dir = next((p for p in cand_solving if p.is_dir()), None)
+        if prob_dir is None:
+            # As a fallback, search repo (shallow) for any match directory
+            cand_any = sorted(self.paths.root.glob(f"**/{pid} -*"))
+            prob_dir = next((p for p in cand_any if p.is_dir()), None)
+        if prob_dir is None:
+            raise SystemExit(f"Problem directory not found for id={pid}. Try providing a name or --lang.")
 
-        rel_src = self._rel(src)
+        # If C++: remove file from CMake target
         if lang == "cpp":
-            self.cmake.remove(rel_src)
-            print(f"{L.OK} removed from ps target: {rel_src}")
-        else:
-            print(f"{L.HINT} python source; nothing to remove from CMake: {rel_src}")
-        print(f"{L.HINT} code file kept: {src.relative_to(self.paths.root)}")
-
-    # ----------------------------- drop command ------------------------------
-    def drop(self, pid: int, name: Optional[str], lang: Optional[str], push: bool, no_git: bool, force: bool = False) -> None:
-        """Remove ALL related artifacts for a problem:
-        - Remove source file (from solving/ or thousand folder)
-        - Remove the file from CMake ps target (when C++)
-        - Remove generated markdown doc under docs/boj/
-        - Remove saved samples under tests/boj/<pid>/
-        - Optionally git commit/push (default commit, push optional)
-        """
-        lang = (lang or self.config.get("lang", "cpp")).lower()
-
-        # 1) Try to locate a code file (prefer solving/, then thousand folder, then anywhere)
-        src: Optional[Path] = None
-        # prefer name-guided path first
-        if name:
-            candidate = self.paths.solving / f"{pid} - {sanitize_filename(name)}.{lang}"
-            if candidate.exists():
-                src = candidate
-        if src is None:
-            cand_solving = sorted(self.paths.solving.glob(f"{pid} -*.{lang}"))
-            if cand_solving:
-                src = cand_solving[0]
-        # also look inside thousand folder
-        if src is None:
-            thousand_dir = self.paths.root / thousand_folder(pid)
-            cand_thousand = sorted(thousand_dir.glob(f"{pid} -*.{lang}"))
-            if cand_thousand:
-                src = cand_thousand[0]
-        # shallow repo search as last resort
-        if src is None:
-            cand_any = sorted(self.paths.root.glob(f"**/{pid} -*.{lang}"))
-            if cand_any:
-                src = cand_any[0]
-        # final try: if still missing and name omitted, try fetching title
-        if src is None and not name:
-            fetched = self.fetcher.fetch(pid)
-            if fetched:
-                name = fetched
-                candidate = self.paths.solving / f"{pid} - {sanitize_filename(name)}.{lang}"
-                if candidate.exists():
-                    src = candidate
-
-        # 2) If C++ and the file is enrolled in CMake, remove it from the ps target
-        if src is not None and lang == "cpp":
-            try:
-                rel_src = self._rel(src)
+            cpp_list = sorted(prob_dir.glob("*.cpp"))
+            if cpp_list:
+                prefer = f"{pid} - "
+                src_path = next((p for p in cpp_list if p.name.startswith(prefer)), cpp_list[0])
+                rel_src = self._rel(src_path)
                 self.cmake.remove(rel_src)
                 print(f"{L.OK} removed from ps target: {rel_src}")
-            except Exception as e:
-                if force:
-                    print(f"{L.WARN} failed to adjust CMake (continuing due to --force): {e}")
-                else:
-                    print(f"{L.WARN} failed to adjust CMake: {e}")
-
-        # 3) Delete the code file(s). We try both solving/ and thousand/ locations just in case.
-        deleted_any = False
-        paths_to_try: list[Path] = []
-        if src is not None:
-            paths_to_try.append(src)
-        # predictable locations by pid/name if known
-        if name:
-            paths_to_try += [
-                self.paths.solving / f"{pid} - {sanitize_filename(name)}.{lang}",
-                (self.paths.root / thousand_folder(pid)) / f"{pid} - {sanitize_filename(name)}.{lang}",
-            ]
-        # unique-ify while preserving order
-        seen = set()
-        uniq_paths: list[Path] = []
-        for p in paths_to_try:
-            try:
-                key = p.resolve()
-            except Exception:
-                key = p
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq_paths.append(p)
-
-        for p in uniq_paths:
-            try:
-                if p.exists():
-                    p.unlink()
-                    print(f"{L.OK} deleted code: {p.relative_to(self.paths.root)}")
-                    deleted_any = True
-            except Exception as e:
-                if force:
-                    print(f"{L.WARN} failed to delete {p}: {e}")
-                else:
-                    raise
-
-        if not deleted_any:
-            msg = f"No code file found for id={pid} (lang={lang})."
-            if force:
-                print(f"{L.WARN} {msg}")
             else:
-                print(f"{L.WARN} {msg}")
+                print(f"{L.HINT} no .cpp under: {prob_dir.relative_to(self.paths.root)} (nothing to remove)")
 
-        # 4) Delete markdown doc(s)
-        doc_dir = self.paths.root / "docs" / "boj"
-        if doc_dir.exists():
-            md_matches = list(doc_dir.glob(f"{pid} -*.md"))
-            if not md_matches and name:
-                md_path = doc_dir / f"{pid} - {sanitize_filename(name)}.md"
-                if md_path.exists():
-                    md_matches = [md_path]
-            for m in md_matches:
-                try:
-                    m.unlink()
-                    print(f"{L.OK} deleted doc: {m.relative_to(self.paths.root)}")
-                except Exception as e:
-                    if force:
-                        print(f"{L.WARN} failed to delete doc {m}: {e}")
-                    else:
-                        raise
-
-        # 5) Delete stored samples
-        tests_dir = self.paths.root / "tests" / "boj" / str(pid)
-        if tests_dir.exists():
-            try:
-                shutil.rmtree(tests_dir, ignore_errors=False)
-                print(f"{L.OK} deleted tests: {tests_dir.relative_to(self.paths.root)}")
-            except Exception as e:
-                if force:
-                    print(f"{L.WARN} failed to delete tests dir {tests_dir}: {e}")
-                else:
-                    raise
-
-        # 6) Optionally git record
-        if not no_git:
-            try:
-                self.git.run("add", "-A")
-                msg = f"chore(boj/drop): #{pid}" + (f" - {name}" if name else "")
-                self.git.run("commit", "-m", msg)
-                print(f"{L.OK} committed: {msg}")
-                if push:
-                    self.git.run("push")
-                    print(f"{L.OK} pushed")
-            except Exception as e:
-                if force:
-                    print(f"{L.WARN} git ops failed (continuing due to --force): {e}")
-                else:
-                    raise
+        print(f"{L.HINT} kept code and files under: {prob_dir.relative_to(self.paths.root)}")
 
     def run_cases_argv(self, argv: List[str], cases: list[tuple[str, str]]) -> list[dict]:
         results = []
@@ -1115,28 +1398,34 @@ class BOJHelper:
             print(f"{L.WARN} No samples found on problem page.")
             return
 
-        # Auto-detect python solution first (preferred when exists)
+        # 파이썬 풀이 우선 자동 탐지
         py_src = None
-        cand_solving = sorted(self.paths.solving.glob(f"{pid} -*.py"))
+        # 신규 레이아웃: "<pid> - */*.py"
+        cand_solving = list(self.paths.solving.glob(f"{pid} -*/**/*.py")) + list(self.paths.solving.glob(f"{pid} -*/*.py"))
         if cand_solving:
             py_src = cand_solving[0]
         else:
-            # also allow thousand folder (e.g., 02000/xxxx.py)
-            py_glob = list(self.paths.root.glob(f"**/{pid} -*.py"))
-            if py_glob:
-                py_src = py_glob[0]
+            # 레거시 단일 파일/천 단위 폴더도 지원
+            legacy_flat = list(self.paths.solving.glob(f"{pid} -*.py"))
+            if legacy_flat:
+                py_src = legacy_flat[0]
+            else:
+                py_glob = list(self.paths.root.glob(f"**/{pid} -*/**/*.py")) + list(self.paths.root.glob(f"**/{pid} -*/*.py")) + list(
+                    self.paths.root.glob(f"**/{pid} -*.py"))
+                if py_glob:
+                    py_src = py_glob[0]
 
         if py_src is not None:
-            # Run with python interpreter
+            # 파이썬 인터프리터로 실행
             import sys as _sys
             argv = [_sys.executable, str(py_src)]
-            results = self.runner.run_cases_argv(argv, samples)
+            results = self.run_cases_argv(argv, samples)
             bin_display = py_src.name
         else:
-            # Fall back to compiled C++ binary
+            # 컴파일된 C++ 바이너리로 폴백
             bin_path = Path(bin_override) if bin_override else self.runner.resolve_bin()
             if not bin_path.exists():
-                # Recompute candidate list to show helpful hint
+                # 후보 목록을 다시 계산해 힌트를 제공
                 build_dir = self.runner._guess_build_dir()
                 exe = "ps.exe" if os.name == "nt" else "ps"
                 run_dir_cfg = self.config.get("run_dir", "${CMAKE_BINARY_DIR}/bin")
@@ -1158,14 +1447,24 @@ class BOJHelper:
                 return
             results = self.runner.run_cases(bin_path, samples)
             bin_display = bin_path.name
-        # Save samples locally
-        base = self.paths.root / "tests" / "boj" / str(pid)
+        # 샘플을 각 문제 디렉터리의 tests/로 저장
+        prob_dir = None
+        cand = sorted(self.paths.solving.glob(f"{pid} -*"))
+        if cand:
+            prob_dir = next((p for p in cand if p.is_dir()), None)
+        if not prob_dir:
+            cand_any = sorted(self.paths.root.glob(f"**/{pid} -*"))
+            prob_dir = next((p for p in cand_any if p.is_dir()), None)
+        if prob_dir:
+            base = prob_dir / "tests"
+        else:
+            base = self.paths.root / "tests" / "boj" / str(pid)
         base.mkdir(parents=True, exist_ok=True)
         for i, (inp, out) in enumerate(samples, 1):
             (base / f"sample-{i}.in").write_text(inp + "\n", encoding="utf-8")
             (base / f"sample-{i}.out").write_text(out + "\n", encoding="utf-8")
 
-        # Pretty, simple text output (no boxes)
+        # 단순 텍스트 출력(박스 없음)
         ok_sym = "✓"
         fail_sym = "✗"
         pass_cnt = 0
@@ -1200,7 +1499,7 @@ class BOJHelper:
             else:
                 pass_cnt += 1
 
-        # Summary line
+        # 요약 라인
         total = len(results)
         summ = f"Passed {pass_cnt}/{total}  |  Binary: {bin_display}"
         print(Ansi.wrap(summ, Ansi.BOLD))
@@ -1223,14 +1522,14 @@ class CLI:
         # start
         sp = sub.add_parser("start", aliases=["s", "st"], help="create file + add into ps target")
         sp.set_defaults(cmd="start")
-        sp.add_argument("id", type=int)
+        sp.add_argument("id", type=int, nargs="?", help="problem id (optional; inferred from directory if omitted)")
         sp.add_argument("name", nargs="?", default=None, help="(optional) problem title; fetched from solved.ac if omitted")
         sp.add_argument("-l", "--lang", choices=["cpp", "py"], default="py")
 
         # finish
         fp = sub.add_parser("finish", aliases=["f", "fin"], help="move file + remove from ps target + git commit/push")
         fp.set_defaults(cmd="finish")
-        fp.add_argument("id", type=int)
+        fp.add_argument("id", type=int, nargs="?", help="problem id (optional; inferred from directory if omitted)")
         fp.add_argument("name", nargs="?", default=None, help="(optional) title; auto-detect if omitted")
         fp.add_argument("-l", "--lang", choices=["cpp", "py"], default="py")
         fp.add_argument("-p", "--push", action="store_true")
@@ -1239,24 +1538,14 @@ class CLI:
         # delete
         dp = sub.add_parser("delete", aliases=["d", "del"], help="remove file from ps target (code is kept; no git)")
         dp.set_defaults(cmd="delete")
-        dp.add_argument("id", type=int)
+        dp.add_argument("id", type=int, nargs="?", help="problem id (optional; inferred from directory if omitted)")
         dp.add_argument("name", nargs="?", default=None, help="(optional) title to help locate the file")
         dp.add_argument("-l", "--lang", choices=["cpp", "py"], default="py")
-
-        # drop
-        xp = sub.add_parser("drop", help="delete all related files (code, doc, tests) and update ps target (no restore)")
-        xp.set_defaults(cmd="drop")
-        xp.add_argument("id", type=int)
-        xp.add_argument("name", nargs="?", default=None, help="(optional) title to help locate files")
-        xp.add_argument("-l", "--lang", choices=["cpp", "py"], default="py")
-        xp.add_argument("-p", "--push", action="store_true")
-        xp.add_argument("-n", "--no-git", action="store_true")
-        xp.add_argument("-f", "--force", action="store_true", help="continue even if some steps fail")
 
         # run
         rp = sub.add_parser("run", aliases=["r"], help="fetch samples and run them against the ps binary")
         rp.set_defaults(cmd="run")
-        rp.add_argument("id", type=int)
+        rp.add_argument("id", type=int, nargs="?", help="problem id (optional; inferred from directory if omitted)")
         rp.add_argument("-b", "--bin", dest="bin", default=None, help="override path to ps binary")
 
         # help
@@ -1269,15 +1558,31 @@ class CLI:
             "  start  (s, st)   create file and add into ps target\n"
             "  finish (f, fin)  move file, remove from ps target, and optionally git commit/push\n"
             "  delete (d, del)  remove from ps target only (code kept, no git)\n"
-            "  drop             delete all related files (code, doc, tests) and update ps target\n"
             "  run    (r)       fetch samples and run them against the ps binary\n"
             "  help   (h)       show this help or per-command usage\n"
         )
         return ap
 
     def run(self, argv: Optional[List[str]] = None) -> None:
+        import re
         ap = self._build_parser()
         args = ap.parse_args(argv)
+
+        # For commands that require an id, make it optional and infer from directory if not provided
+        commands_with_id = {"start", "finish", "delete", "run"}
+        if args.cmd in commands_with_id:
+            # Only infer if id is None
+            if getattr(args, "id", None) is None:
+                cwd = Path.cwd()
+                # Try to extract leading integer from directory name, which starts with number + space or dash
+                m = re.match(r"^(\d+)[\s-]", cwd.name)
+                if m:
+                    try:
+                        args.id = int(m.group(1))
+                    except Exception:
+                        pass
+                else:
+                    raise SystemExit("Problem ID not provided and current directory is not a problem directory.")
 
         if args.cmd == "start":
             self.h.start(args.id, args.name, args.lang)
@@ -1285,8 +1590,6 @@ class CLI:
             self.h.finish(args.id, args.name, args.lang, args.push, args.no_git)
         elif args.cmd == "delete":
             self.h.delete(args.id, args.name, args.lang)
-        elif args.cmd == "drop":
-            self.h.drop(args.id, args.name, args.lang, args.push, args.no_git, getattr(args, "force", False))
         elif args.cmd == "run":
             self.h.run(args.id, args.bin)
         elif args.cmd == "help":
@@ -1313,13 +1616,11 @@ class CLI:
                     print("usage: boj finish|f|fin <id> [name] [-l {cpp,py}] [-p] [-n]")
                 elif canonical == "delete":
                     print("usage: boj delete|d|del <id> [name] [-l {cpp,py}]")
-                elif canonical == "drop":
-                    print("usage: boj drop <id> [name] [-l {cpp,py}] [-p] [-n] [-f]")
                 elif canonical == "run":
                     print("usage: boj run|r <id> [-b <path-to-ps>]")
 
 
-# ================================== Entrypoint ================================
+# ================================== 엔트리포인트 ================================
 
 def main() -> None:
     paths = RepoPaths(root=Path(__file__).resolve().parent)

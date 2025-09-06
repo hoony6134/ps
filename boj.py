@@ -1261,11 +1261,61 @@ class BOJHelper:
             print(f"{L.HINT} python source created; not added to CMake target: {rel_src}")
 
         # Change current working directory to the new problem directory
+        self._set_working_directory(prob_dir)
+        
+    def _set_working_directory(self, path: Path) -> None:
+        """작업 디렉터리를 설정합니다."""
         try:
-            os.chdir(prob_dir)
-            print(f"{L.HINT} Changed working directory to: {prob_dir}")
+            os.chdir(path)
+            print(f"{L.HINT} Changed working directory to: {path}")
         except Exception as e:
             print(f"{L.WARN} Failed to change working directory: {e}")
+    
+    def _add_solution_to_readme(self, prob_dir: Path, src_path: Optional[Path], lang: str) -> None:
+        """README.md에 정답 코드를 추가합니다."""
+        readme_path = prob_dir / "README.md"
+        if not readme_path.exists():
+            print(f"{L.WARN} README.md not found in {prob_dir}")
+            return
+            
+        # Find source file if not provided
+        if src_path is None:
+            # Look for source files in the problem directory
+            src_files = list(prob_dir.glob(f"*.{lang}"))
+            if not src_files:
+                print(f"{L.WARN} No .{lang} files found in {prob_dir}")
+                return
+            # Use the first matching source file
+            src_path = src_files[0]
+        
+        if not src_path or not src_path.exists():
+            print(f"{L.WARN} Source file not found: {src_path}")
+            return
+            
+        try:
+            # Read the source code
+            source_code = src_path.read_text(encoding="utf-8")
+            
+            # Read current README content
+            readme_content = readme_path.read_text(encoding="utf-8")
+            
+            # Check if solution already exists
+            if "## 정답 코드" in readme_content:
+                print(f"{L.SKIP} Solution code already exists in README.md")
+                return
+            
+            # Add solution section
+            lang_display = "cpp" if lang == "cpp" else "python"
+            solution_section = f"\n\n## 정답 코드\n\n```{lang_display}\n{source_code}\n```\n"
+            
+            # Append to README
+            updated_content = readme_content.rstrip() + solution_section
+            readme_path.write_text(updated_content, encoding="utf-8")
+            
+            print(f"{L.OK} Added solution code to README.md")
+            
+        except Exception as e:
+            print(f"{L.WARN} Failed to add solution to README: {e}")
 
     # ---------------------------- finish command -----------------------------
     def finish(self, pid: int, name: Optional[str], lang: Optional[str], push: bool, no_git: bool) -> None:
@@ -1327,6 +1377,9 @@ class BOJHelper:
         else:
             shutil.move(str(prob_dir), str(dst))
         print(f"{L.OK} moved to: {dst.relative_to(self.paths.root)}")
+        
+        # Add solution code to README
+        self._add_solution_to_readme(dst, src_path, lang)
 
         if not no_git:
             self.git.run("add", "-A")
@@ -1370,6 +1423,61 @@ class BOJHelper:
                 print(f"{L.HINT} no .cpp under: {prob_dir.relative_to(self.paths.root)} (nothing to remove)")
 
         print(f"{L.HINT} kept code and files under: {prob_dir.relative_to(self.paths.root)}")
+
+    # ---------------------------- drop command -----------------------------
+    def drop(self, pid: int, name: Optional[str], lang: Optional[str]) -> None:
+        """문제 디렉터리를 완전히 삭제합니다."""
+        lang = (lang or self.config.get("lang", "py")).lower()
+
+        # Try to locate the problem directory
+        prob_dir: Optional[Path] = None
+        if name:
+            candidate = self.paths.solving / f"{pid} - {sanitize_filename(name)}"
+            if candidate.exists() and candidate.is_dir():
+                prob_dir = candidate
+        if prob_dir is None:
+            cand_solving = sorted(self.paths.solving.glob(f"{pid} -*"))
+            prob_dir = next((p for p in cand_solving if p.is_dir()), None)
+        if prob_dir is None:
+            # Search in completed problems (thousand folders)
+            thousand_dir = self.paths.root / thousand_folder(pid)
+            if thousand_dir.exists():
+                cand_thousand = sorted(thousand_dir.glob(f"{pid} -*"))
+                prob_dir = next((p for p in cand_thousand if p.is_dir()), None)
+        
+        if prob_dir is None:
+            raise SystemExit(f"Problem directory not found for id={pid}. Try providing a name.")
+
+        # If C++: remove file from CMake target first
+        if lang == "cpp":
+            cpp_list = sorted(prob_dir.glob("*.cpp"))
+            if cpp_list:
+                prefer = f"{pid} - "
+                src_path = next((p for p in cpp_list if p.name.startswith(prefer)), cpp_list[0])
+                rel_src = self._rel(src_path)
+                try:
+                    self.cmake.remove(rel_src)
+                    print(f"{L.OK} removed from ps target: {rel_src}")
+                except Exception as e:
+                    print(f"{L.WARN} failed to remove from CMake: {e}")
+
+        # Confirm deletion
+        print(f"{L.WARN} This will permanently delete: {prob_dir.relative_to(self.paths.root)}")
+        try:
+            response = input("Are you sure? (y/N): ").strip().lower()
+            if response not in ('y', 'yes'):
+                print(f"{L.SKIP} Deletion cancelled")
+                return
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n{L.SKIP} Deletion cancelled")
+            return
+
+        # Delete the directory
+        try:
+            shutil.rmtree(prob_dir)
+            print(f"{L.OK} Deleted: {prob_dir.relative_to(self.paths.root)}")
+        except Exception as e:
+            print(f"{L.ERROR} Failed to delete directory: {e}")
 
     def run_cases_argv(self, argv: List[str], cases: list[tuple[str, str]]) -> list[dict]:
         results = []
@@ -1541,6 +1649,13 @@ class CLI:
         dp.add_argument("id", type=int, nargs="?", help="problem id (optional; inferred from directory if omitted)")
         dp.add_argument("name", nargs="?", default=None, help="(optional) title to help locate the file")
         dp.add_argument("-l", "--lang", choices=["cpp", "py"], default="py")
+        
+        # drop
+        drp = sub.add_parser("drop", aliases=["dr"], help="permanently delete problem directory")
+        drp.set_defaults(cmd="drop")
+        drp.add_argument("id", type=int, nargs="?", help="problem id (optional; inferred from directory if omitted)")
+        drp.add_argument("name", nargs="?", default=None, help="(optional) title to help locate the file")
+        drp.add_argument("-l", "--lang", choices=["cpp", "py"], default="py")
 
         # run
         rp = sub.add_parser("run", aliases=["r"], help="fetch samples and run them against the ps binary")
@@ -1558,6 +1673,7 @@ class CLI:
             "  start  (s, st)   create file and add into ps target\n"
             "  finish (f, fin)  move file, remove from ps target, and optionally git commit/push\n"
             "  delete (d, del)  remove from ps target only (code kept, no git)\n"
+            "  drop   (dr)      permanently delete problem directory\n"
             "  run    (r)       fetch samples and run them against the ps binary\n"
             "  help   (h)       show this help or per-command usage\n"
         )
@@ -1569,7 +1685,7 @@ class CLI:
         args = ap.parse_args(argv)
 
         # For commands that require an id, make it optional and infer from directory if not provided
-        commands_with_id = {"start", "finish", "delete", "run"}
+        commands_with_id = {"start", "finish", "delete", "drop", "run"}
         if args.cmd in commands_with_id:
             # Only infer if id is None
             if getattr(args, "id", None) is None:
@@ -1590,6 +1706,8 @@ class CLI:
             self.h.finish(args.id, args.name, args.lang, args.push, args.no_git)
         elif args.cmd == "delete":
             self.h.delete(args.id, args.name, args.lang)
+        elif args.cmd == "drop":
+            self.h.drop(args.id, args.name, args.lang)
         elif args.cmd == "run":
             self.h.run(args.id, args.bin)
         elif args.cmd == "help":
@@ -1603,6 +1721,7 @@ class CLI:
                     "s": "start", "st": "start", "start": "start",
                     "f": "finish", "fin": "finish", "finish": "finish",
                     "d": "delete", "del": "delete", "delete": "delete",
+                    "dr": "drop", "drop": "drop",
                     "r": "run", "run": "run",
                 }
                 canonical = alias_map.get(topic)
@@ -1616,6 +1735,8 @@ class CLI:
                     print("usage: boj finish|f|fin <id> [name] [-l {cpp,py}] [-p] [-n]")
                 elif canonical == "delete":
                     print("usage: boj delete|d|del <id> [name] [-l {cpp,py}]")
+                elif canonical == "drop":
+                    print("usage: boj drop|dr <id> [name] [-l {cpp,py}]")
                 elif canonical == "run":
                     print("usage: boj run|r <id> [-b <path-to-ps>]")
 

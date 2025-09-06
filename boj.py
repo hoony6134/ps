@@ -1330,7 +1330,7 @@ class BOJHelper:
 
         if not no_git:
             self.git.run("add", "-A")
-            msg = f"solve: {pid} - {name or prob_dir.name.split(' - ', 1)[-1]}"
+            msg = f"feat(boj/solve): {pid} - {name or prob_dir.name.split(' - ', 1)[-1]}"
             self.git.run("commit", "-m", msg)
             print(f"{L.OK} committed: {msg}")
             if push:
